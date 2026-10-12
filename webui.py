@@ -41,6 +41,13 @@ load_dotenv(ENV_FILE)
 DB_FILE = PROJECT / "state.db"
 UNLIM_DB_FILE = PROJECT / "unlim_state.db"
 COOKIES_FILE = PROJECT / "cookies.json"
+MAX_UNLIM_WORKERS = 100
+
+
+def unlim_worker_args(worker_id: int, single: bool = True) -> list[str]:
+    """single — по одному файлу через mpfs/url (работает, даже когда Яндекс
+    отключил ZIP-архивы, mpfs code 394); иначе — пачками через ZIP."""
+    return ["--id", str(worker_id)] + (["--single"] if single else [])
 TEMPLATES_DIR = PROJECT / "webui_assets"
 
 
@@ -147,6 +154,7 @@ class Task:
         return self.proc.poll() is None
 
     def stop(self):
+        self.user_stopped = True  # супервизор такие не воскрешает
         if self.alive():
             self.proc.terminate()
             try:
@@ -193,6 +201,7 @@ class TaskManager:
                 env=env,
             )
             self._tasks[slot] = Task(slot, proc)
+            self._tasks[slot].args = args  # для перезапуска с теми же параметрами
             return True, f"Запущено: {slot}"
 
     def stop(self, slot: str) -> tuple[bool, str]:
@@ -356,14 +365,18 @@ class Pipeline:
                     ok, msg = self._own_start("unlim_collect", "unlim_download.py", ["--collect"])
                     if not ok:
                         self._log(f"❌ unlim collect: {msg}"); self.state = "failed"; return
-                    self._wait_task("unlim_collect", "✓ список безлимита собран")
+                    code = self._wait_task("unlim_collect", "список безлимита: collect завершён")
                     if self._stop: self._abort(); return
+                    if code != 0:
+                        self._log("❌ unlim collect упал — воркеры не запускаю. "
+                                  "Причина в логе задачи unlim_collect и logs/unlim.log")
+                        self.state = "failed"; return
 
                     # workers
                     self.step = f"скачиваю безлимит ({self.workers} воркеров)"
                     self._log(f"🚀 Запускаю {self.workers} воркеров...")
                     for i in range(1, self.workers + 1):
-                        ok, msg = self._own_start(f"unlim_w{i}", "unlim_worker.py", ["--id", str(i)])
+                        ok, msg = self._own_start(f"unlim_w{i}", "unlim_worker.py", unlim_worker_args(i))
                         if ok:
                             self._log(f"  ✓ воркер {i} запущен")
                         else:
@@ -412,6 +425,155 @@ class Pipeline:
 pipeline = Pipeline()
 
 
+# ── Автовоскрешение воркеров безлимита ──────────────────────────────────────
+
+# Коды выхода, после которых перезапуск не поможет
+NO_RESTART_RC = {
+    0: "очередь пуста",
+    2: "куки протухли — обнови cookies.json",
+    4: "Яндекс отключил архивы (code 394)",
+    130: "остановлен",
+}
+RESTART_DELAYS = (15, 30, 60, 120, 300)  # пауза перед 1-м, 2-м… воскрешением
+# Нет пульса дольше этого — воркер завис. Во время закачки он отмечается раз в 15 с,
+# а самое долгое молчание по таймаутам — запрос ссылки (60 с) + соединение и чтение (30 с)
+HUNG_RUNNING_SEC = 180
+HUNG_WAITING_EXTRA = 60  # пауза «waiting Ns» затянулась дольше N + столько
+NO_SUCCESS_SEC = 300     # ни одного скачанного файла за 5 мин — перезапуск
+MAX_RESTARTS_PER_HOUR = 10
+
+
+class Supervisor:
+    """Следит за воркерами, запущенными из веба, и перезапускает упавших
+    (rc=3, трейсбек, убит системой) с нарастающей паузой."""
+
+    def __init__(self):
+        self.info: dict[str, dict] = {}  # slot -> restarts / next_at / last_rc / gave_up
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                self.tick()
+            except Exception as e:  # супервизор не должен умирать
+                print(f"[supervisor] {e}")
+            time.sleep(5)
+
+    def _heartbeats(self) -> dict[int, tuple[str, float, float]]:
+        """worker_id -> (state, updated, последний успех или старт) из БД воркеров."""
+        if not UNLIM_DB_FILE.exists():
+            return {}
+        try:
+            c = sqlite3.connect(UNLIM_DB_FILE, timeout=5)  # не mode=ro: WAL-база без -shm так не открывается
+            try:
+                return {r[0]: (r[1] or "", r[2] or 0, r[3] or r[4] or 0) for r in c.execute(
+                    "SELECT worker_id, state, updated, last_ok, started FROM unlim_workers")}
+            finally:
+                c.close()
+        except sqlite3.Error:
+            return {}
+
+    def _hung_for(self, state: str, updated: float, now: float) -> Optional[int]:
+        """Сколько секунд воркер молчит сверх нормы (None — всё нормально)."""
+        silent = now - updated
+        if state == "running":
+            return int(silent) if silent > HUNG_RUNNING_SEC else None
+        if state.startswith("waiting "):
+            try:
+                planned = int(state.split()[1].rstrip("s"))
+            except (IndexError, ValueError):
+                planned = 0
+            return int(silent) if silent > planned + HUNG_WAITING_EXTRA else None
+        return None
+
+    def tick(self):
+        now = time.time()
+        with tm._lock:
+            items = [(slot, t) for slot, t in tm._tasks.items() if slot.startswith("unlim_w")]
+
+        # Живые, но зависшие: перезапускаем так же, как кнопкой «↻»
+        beats = self._heartbeats()
+        for slot, t in items:
+            if not t.alive() or getattr(t, "user_stopped", False) or not getattr(t, "args", None):
+                continue
+            if now - t.started_at < HUNG_RUNNING_SEC:
+                continue  # только что запущен, строку в БД ещё не обновил
+            wid = int(slot.rsplit("w", 1)[1])
+            state, updated, last_ok = beats.get(wid, ("", 0, 0))
+            hung = self._hung_for(state, updated, now) if updated else None
+            if hung is not None:
+                why = f"завис: {hung}с без признаков жизни ({state})"
+            elif last_ok and state == "running" and now - last_ok > NO_SUCCESS_SEC:
+                # Жив и работает, но ничего не скачал — что-то сломалось внутри
+                why = f"{int(now - last_ok) // 60} мин без единого скачанного файла"
+            else:
+                continue
+            st = self.info.setdefault(slot, {"restarts": [], "next_at": None,
+                                             "pid": None, "last_rc": None, "gave_up": None})
+            st["restarts"] = [x for x in st["restarts"] if now - x < 3600]
+            if len(st["restarts"]) >= MAX_RESTARTS_PER_HOUR:
+                if not st.get("gave_up"):
+                    st["gave_up"] = f"{len(st['restarts'])} перезапусков за час — больше не дёргаю"
+                    t.log.append(f"[авто] {why}, но {st['gave_up']}")
+                continue
+            st["gave_up"] = None
+            st["restarts"].append(now)
+            t.log.append(f"[авто] {why} — перезапускаю")
+            tm.stop(slot)
+            ok, _ = tm.start(slot, "unlim_worker.py", t.args)
+            if ok:
+                with tm._lock:
+                    nt = tm._tasks.get(slot)
+                if nt:
+                    nt.log.append(f"[авто] перезапущен: {why}")
+
+        for slot, t in items:
+            if t.alive() or getattr(t, "user_stopped", False) or not getattr(t, "args", None):
+                continue
+            rc = t.proc.poll()
+            if rc in NO_RESTART_RC:
+                continue
+            st = self.info.setdefault(slot, {"restarts": [], "next_at": None,
+                                             "pid": None, "last_rc": None, "gave_up": None})
+            if st["pid"] == t.proc.pid and st["next_at"] is None:
+                continue  # этот процесс уже обработан (сдались)
+            if st["pid"] != t.proc.pid:
+                # Свежая смерть — планируем воскрешение
+                st.update(pid=t.proc.pid, last_rc=rc, gave_up=None)
+                st["restarts"] = [x for x in st["restarts"] if now - x < 3600]
+                if len(st["restarts"]) >= MAX_RESTARTS_PER_HOUR:
+                    st["next_at"] = None
+                    st["gave_up"] = f"{len(st['restarts'])} падений за час — не воскрешаю"
+                    t.log.append(f"[авто] {st['gave_up']}")
+                    continue
+                delay = RESTART_DELAYS[min(len(st["restarts"]), len(RESTART_DELAYS) - 1)]
+                st["next_at"] = now + delay
+                t.log.append(f"[авто] воркер упал (rc={rc}), воскрешу через {delay}с")
+                continue
+            if now >= st["next_at"]:
+                st["next_at"] = None
+                st["restarts"].append(now)
+                ok, msg = tm.start(slot, "unlim_worker.py", t.args)
+                if ok:
+                    with tm._lock:
+                        nt = tm._tasks.get(slot)
+                    if nt:
+                        nt.log.append(f"[авто] воскрешён после rc={st['last_rc']} "
+                                      f"({len(st['restarts'])}-й раз за час)")
+
+    def status(self, slot: str) -> dict:
+        st = self.info.get(slot)
+        if not st:
+            return {}
+        now = time.time()
+        return {"restarts": len([x for x in st["restarts"] if now - x < 3600]),
+                "restart_in": int(st["next_at"] - now) if st["next_at"] else None,
+                "last_rc": st["last_rc"], "gave_up": st["gave_up"]}
+
+
+supervisor = Supervisor()
+
+
 # ── Чтение состояния ────────────────────────────────────────────────────────
 
 
@@ -422,7 +584,7 @@ def db_stats(db_file: Path, table: str = "files",
                 "failed": 0, "in_progress": 0,
                 "bytes_total": 0, "bytes_done": 0, "recent": []}
     try:
-        c = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=30)
+        c = sqlite3.connect(db_file, timeout=30)  # не mode=ro: WAL-база без -shm так не открывается
         c.row_factory = sqlite3.Row
         out = {"total": 0, "pending": 0, "downloaded": 0, "skipped": 0,
                "failed": 0, "in_progress": 0,
@@ -700,19 +862,31 @@ def preview_db(db_file: Path, table: str, id_col: str) -> dict:
     if not db_file.exists():
         return {"empty": True, "categories": {}}
     try:
-        c = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=30)
+        c = sqlite3.connect(db_file, timeout=30)  # не mode=ro: WAL-база без -shm так не открывается
         summary: dict[str, dict] = {
-            k: {"count": 0, "bytes": 0, "label": CATEGORY_LABELS[k]}
+            k: {"count": 0, "bytes": 0, "label": CATEGORY_LABELS[k],
+                "done": 0, "done_bytes": 0, "left": 0, "failed": 0, "skipped": 0,
+                "preview": 0}
             for k in list(CATEGORY_LABELS.keys())
         }
         total = 0
-        for row in c.execute(
-            f"SELECT {id_col}, COALESCE(size, 0) FROM {table} "
-            f"WHERE status IN ('pending','downloaded','skipped','in_progress','failed')"
+        for path, size, status in c.execute(
+            f"SELECT {id_col}, COALESCE(size, 0), status FROM {table} "
+            f"WHERE status IN ('pending','downloaded','skipped','in_progress','failed',"
+            f"'preview','preview_in_progress')"
         ):
-            cat = categorize(row[0])
-            summary[cat]["count"] += 1
-            summary[cat]["bytes"] += row[1]
+            cat = summary[categorize(path)]
+            cat["count"] += 1
+            cat["bytes"] += size
+            if status == "downloaded":
+                cat["done"] += 1
+                cat["done_bytes"] += size
+            elif status in ("pending", "in_progress"):
+                cat["left"] += 1
+            elif status == "preview_in_progress":
+                cat["failed"] += 1  # оригинала нет, превью как раз качается
+            else:
+                cat[status] += 1
             total += 1
         c.close()
         return {"empty": total == 0, "total": total, "categories": summary}
@@ -788,6 +962,106 @@ def disk_preview():
     return preview_db(DB_FILE, "files", "remote_path")
 
 
+STUCK_AFTER_SEC = 60  # столько на одном файле — подсвечиваем как «залип»
+
+
+def _pid_alive(pid: Optional[int]) -> Optional[bool]:
+    """None — не знаем. На Windows os.kill(pid, 0) завершает процесс, не трогаем."""
+    if not pid or os.name == "nt":
+        return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None
+
+
+@app.get("/api/unlim/workers")
+def unlim_workers():
+    """Что качает каждый воркер прямо сейчас и сколько на этом висит."""
+    out: dict[str, Any] = {"workers": [], "recent_5m": 0, "last_done_ago": None,
+                           "stuck_after": STUCK_AFTER_SEC}
+    if not UNLIM_DB_FILE.exists():
+        return out
+    now = time.time()
+    try:
+        c = sqlite3.connect(UNLIM_DB_FILE, timeout=5)  # не mode=ro: WAL-база без -shm так не открывается
+        c.row_factory = sqlite3.Row
+        try:
+            try:
+                rows = [dict(r) for r in c.execute(
+                    "SELECT * FROM unlim_workers ORDER BY worker_id")]
+            except sqlite3.OperationalError:
+                rows = []  # таблицы нет — воркеры запущены старой версией
+            out["recent_5m"] = c.execute(
+                "SELECT COUNT(*) FROM unlim_files WHERE status='downloaded' "
+                "AND downloaded_at > datetime('now', '-5 minutes')").fetchone()[0]
+            ago = c.execute(
+                "SELECT (julianday('now') - julianday(MAX(downloaded_at))) * 86400 "
+                "FROM unlim_files WHERE status='downloaded'").fetchone()[0]
+            out["last_done_ago"] = None if ago is None else int(ago)
+        finally:
+            c.close()
+    except sqlite3.Error as e:
+        out["error"] = str(e)
+        return out
+
+    for r in rows:
+        state = r.get("state") or ""
+        active = state == "running" or state.startswith("waiting")
+        alive = _pid_alive(r.get("pid"))
+        if active and alive is False:
+            state = "убит"  # процесс исчез, не успев записать финальный статус
+            active = False
+        secs = lambda t: None if not t else int(now - t)
+        sup = supervisor.status(f"unlim_w{r['worker_id']}")
+        if active and state.startswith("waiting "):
+            # «waiting 120s (storage)» → «пауза: хранилище не отвечает, ещё 23с»
+            try:
+                planned = int(state.split()[1].rstrip("s"))
+                left = max(0, int(planned - (now - (r.get("updated") or now))))
+                why = {"(storage)": "хранилище не отвечает", "(429)": "Яндекс просит притормозить",
+                       "(отложенные)": "жду отложенные файлы"}.get(state.split(" ", 2)[-1], "")
+                state = f"пауза: {why}, ещё {left}с" if why else f"пауза, ещё {left}с"
+            except (IndexError, ValueError):
+                pass
+        if sup.get("restart_in") is not None:
+            state = f"упал (rc={sup['last_rc']}), воскрешу через {max(0, sup['restart_in'])}с"
+        elif sup.get("gave_up"):
+            state = sup["gave_up"]
+        out["workers"].append({
+            "restarts": sup.get("restarts", 0),
+            "id": r["worker_id"], "mode": r.get("mode"), "state": state, "active": active,
+            "file": r.get("file_id") if active else None,
+            "file_secs": secs(r.get("file_started")) if active else None,
+            # залип = молчит (нет пульса), а не просто долго качает большой файл
+            "stuck": active and (r.get("state") == "running")
+                     and (secs(r.get("updated")) or 0) > STUCK_AFTER_SEC,
+            "attempt": r.get("attempt"),
+            "files_done": r.get("files_done") or 0, "bytes_done": r.get("bytes_done") or 0,
+            "last_ok_ago": secs(r.get("last_ok")),
+            "last_error": r.get("last_error"), "last_error_ago": secs(r.get("last_error_at")),
+        })
+    return out
+
+
+@app.post("/api/unlim/workers/{wid}/restart")
+def unlim_worker_restart(wid: int):
+    """Останавливает воркер (он откладывает текущий файл и возвращает пачку
+    в очередь) и сразу запускает его заново с теми же параметрами."""
+    slot = f"unlim_w{wid}"
+    with tm._lock:
+        t = tm._tasks.get(slot)
+    args = getattr(t, "args", None) if t else None
+    if not args:
+        return {"ok": False, "msg": f"Воркер {wid} запущен не из веба — "
+                                    f"перезапусти его в терминале (Ctrl+C и снова)"}
+    tm.stop(slot)
+    return _resp(tm.start(slot, "unlim_worker.py", args))
+
+
 @app.get("/api/unlim/preview")
 def unlim_preview():
     return preview_db(UNLIM_DB_FILE, "unlim_files", "file_id")
@@ -795,7 +1069,8 @@ def unlim_preview():
 
 class SelectivePayload(BaseModel):
     categories: list[str]
-    workers: int = Field(default=4, ge=1, le=6)
+    workers: int = Field(default=4, ge=1, le=MAX_UNLIM_WORKERS)
+    single: bool = True  # только для безлимита: по одному файлу или ZIP-пачками
 
 
 @app.post("/api/disk/download_selected")
@@ -811,16 +1086,68 @@ def disk_download_selected(payload: SelectivePayload):
     return {"ok": ok, "msg": msg}
 
 
+class RetryFailedPayload(BaseModel):
+    categories: list[str]
+
+
+@app.post("/api/unlim/retry_failed")
+def unlim_retry_failed(payload: RetryFailedPayload):
+    """Возвращает failed в очередь — только из выбранных категорий, чтобы
+    не воскресить, скажем, видео, когда качаем одни фото. Работающие воркеры
+    подхватят их сами."""
+    if not UNLIM_DB_FILE.exists():
+        return {"ok": False, "msg": "Список ещё не собран"}
+    sel = set(payload.categories)
+    c = sqlite3.connect(UNLIM_DB_FILE, timeout=30)
+    try:
+        ids = [fid for (fid,) in c.execute(
+            "SELECT file_id FROM unlim_files WHERE status IN ('failed', 'preview')")
+            if categorize(fid) in sel]
+        cols = {r[1] for r in c.execute("PRAGMA table_info(unlim_files)")}
+        reset = ", retries=0, next_try_at=NULL" if "retries" in cols else ""
+        c.execute("BEGIN IMMEDIATE")
+        c.executemany(f"UPDATE unlim_files SET status='pending', error=NULL{reset} "
+                      f"WHERE file_id=?", [(i,) for i in ids])
+        c.execute("COMMIT")
+    finally:
+        c.close()
+    return {"ok": True, "returned": len(ids),
+            "msg": f"Вернул в очередь: {len(ids):,}".replace(",", " ")}
+
+
+PREVIEW_WORKER_BASE = 1000  # id превью-воркеров: 1001, 1002… — не путаются с обычными
+
+
+class PreviewsPayload(BaseModel):
+    # Свой класс, а не WorkersPayload: тот объявлен ниже по файлу, и при
+    # from __future__ import annotations FastAPI принял бы payload за query-параметр
+    workers: int = 4
+
+
+@app.post("/api/unlim/previews")
+def unlim_previews(payload: PreviewsPayload):
+    """Качает превью (до 1280 px) для фото, чей оригинал Яндекс не отдал."""
+    n = max(1, min(payload.workers, 20))
+    started = []
+    for i in range(1, n + 1):
+        wid = PREVIEW_WORKER_BASE + i
+        ok, _ = tm.start(f"unlim_w{wid}", "unlim_worker.py", ["--id", str(wid), "--previews"])
+        if ok:
+            started.append(wid)
+    return {"ok": True, "started": started,
+            "msg": f"Запущено превью-воркеров: {len(started)}"}
+
+
 @app.post("/api/unlim/download_selected")
 def unlim_download_selected(payload: SelectivePayload):
     unskip_category_marker(UNLIM_DB_FILE, "unlim_files")
     filter_to_categories(UNLIM_DB_FILE, "unlim_files", "file_id",
                          payload.categories)
-    n = max(1, min(payload.workers, 6))
+    n = max(1, min(payload.workers, MAX_UNLIM_WORKERS))
     started = []
     failed = []
     for i in range(1, n + 1):
-        ok, msg = tm.start(f"unlim_w{i}", "unlim_worker.py", ["--id", str(i)])
+        ok, msg = tm.start(f"unlim_w{i}", "unlim_worker.py", unlim_worker_args(i, payload.single))
         if ok:
             started.append(i)
         else:
@@ -898,15 +1225,16 @@ def unlim_collect():
 
 class WorkersPayload(BaseModel):
     workers: int = 4
+    single: bool = True
 
 
 @app.post("/api/unlim/start_workers")
 def unlim_start_workers(payload: WorkersPayload):
-    n = max(1, min(payload.workers, 6))
+    n = max(1, min(payload.workers, MAX_UNLIM_WORKERS))
     started = []
     failed = []
     for i in range(1, n + 1):
-        ok, msg = tm.start(f"unlim_w{i}", "unlim_worker.py", ["--id", str(i)])
+        ok, msg = tm.start(f"unlim_w{i}", "unlim_worker.py", unlim_worker_args(i, payload.single))
         if ok:
             started.append(i)
         else:

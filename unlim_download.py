@@ -15,8 +15,6 @@ import argparse
 import json
 import logging
 import os
-import random
-import re
 import sqlite3
 import sys
 import threading
@@ -26,18 +24,16 @@ import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from unlim_http import (PHOTO_EXTS, ApiError, AuthError, call_model, describe_cookies,
+                        get_sk_uid, load_cookies, make_session)
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(PROJECT, ".env"))
 
-COOKIES_FILE = os.path.join(PROJECT, "cookies.json")
 DB_FILE = os.path.join(PROJECT, "unlim_state.db")
 LOG_FILE = os.path.join(PROJECT, "logs", "unlim.log")
-
-BASE = "https://disk.yandex.ru"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, encoding="utf-8",
@@ -92,73 +88,27 @@ def db_init():
 # ── HTTP ────────────────────────────────────────────────────────────────────
 
 
-def load_cookies() -> dict[str, str]:
-    if not os.path.exists(COOKIES_FILE):
-        sys.exit("Нет cookies.json — сначала экспортируй куки из браузера. "
-                 "См. README раздел про куки.")
-    raw = json.loads(open(COOKIES_FILE, encoding="utf-8").read())
-    if not isinstance(raw, list):
-        sys.exit("cookies.json должен быть массивом (формат Cookie-Editor)")
-    return {c["name"]: c["value"] for c in raw
-            if c.get("name") and c.get("value") is not None}
-
-
-def make_session(cookies: dict[str, str]) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": UA, "Accept": "*/*",
-        "Accept-Language": "ru,en;q=0.9",
-        "Origin": BASE, "Referer": f"{BASE}/client/photo",
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/json",
-    })
-    for k, v in cookies.items():
-        s.cookies.set(k, v, domain=".yandex.ru")
-    return s
-
-
-def get_sk_uid(s: requests.Session) -> tuple[str, str]:
-    r = s.get(f"{BASE}/client/disk", timeout=30)
-    if "passport.yandex" in r.url or r.status_code != 200:
-        sys.exit("Куки невалидны — нужно обновить cookies.json")
-    sk = re.search(r'"sk"\s*:\s*"([^"]+)"', r.text)
-    uid = re.search(r'"uid"\s*:\s*"?(\d+)"?', r.text)
-    if not sk or not uid:
-        sys.exit("Не нашёл sk/uid в HTML — Яндекс изменил формат")
-    return sk.group(1), uid.group(1)
-
-
-def make_cid(uid: str) -> str:
-    return f"{uid}{int(time.time() * 1000)}{random.randint(100, 999)}"
-
-
 def api_call(s: requests.Session, sk: str, uid: str, method: str,
              params=None, retries: int = 3):
     last_err = None
     for att in range(retries):
         try:
-            body = {"sk": sk, "connection_id": make_cid(uid), "apiMethod": method}
-            if params is not None:
-                body["requestParams"] = params
-            r = s.post(f"{BASE}/models-v2", params={"m": method},
-                       json=body, timeout=120)
-            if r.status_code == 200:
-                try:
-                    return r.json()
-                except Exception:
-                    return None
-            if r.status_code in (401, 403):
-                sys.exit(f"Сессия истекла (HTTP {r.status_code})")
-            if r.status_code == 429:
+            return call_model(s, sk, uid, method, params)
+        except AuthError:
+            raise
+        except ApiError as e:
+            last_err = str(e)
+            if " HTTP 429" in last_err:
                 wait = 30 + att * 30
                 log.warning(f"{method} HTTP 429 → sleep {wait}")
                 time.sleep(wait)
                 continue
-            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            log.warning(last_err)
         except Exception as e:
-            last_err = str(e)
-            time.sleep(2 ** att)
-    raise RuntimeError(f"{method}: {last_err}")
+            last_err = f"{method}: {e}"
+            log.warning(last_err)
+        time.sleep(2 ** att)
+    raise RuntimeError(last_err)
 
 
 # ── Логика сбора photoslice ─────────────────────────────────────────────────
@@ -208,6 +158,13 @@ def fetch_cluster_resources(s, sk, uid, psid, cluster_rows: list[dict]) -> int:
         "hideScreenshots": False,
     })
     fetched = (res.get("clusters") or {}).get("fetched") or []
+    if not getattr(fetch_cluster_resources, "_sampled", False):
+        sample = next((f for cl in fetched for f in cl.get("items") or []), None)
+        if sample is not None:
+            # Один пример элемента — чтобы видеть, в каком виде приходит id
+            log.info(f"sample item: {json.dumps(sample, ensure_ascii=False)[:1000]}")
+            tqdm.write(f"  пример id файла: {sample.get('id') or sample.get('resource_id')!r}")
+            fetch_cluster_resources._sampled = True
     added = 0
     c = db()
     c.execute("BEGIN IMMEDIATE")
@@ -245,9 +202,12 @@ def fetch_cluster_resources(s, sk, uid, psid, cluster_rows: list[dict]) -> int:
 
 def cmd_collect():
     db_init()
-    s = make_session(load_cookies())
+    cookies = load_cookies()
+    print(f"  cookies.json: {describe_cookies(cookies)}")
+    log.info(f"cookies: {describe_cookies(cookies)}")
+    s = make_session(cookies)
     try:
-        sk, uid = get_sk_uid(s)
+        sk, uid = get_sk_uid(s, log)
         print(f"  ✓ uid={uid}, sk OK")
 
         psid = init_snapshot(s, sk, uid)
@@ -264,14 +224,20 @@ def cmd_collect():
         BATCH = 15
         bar = tqdm(total=len(todo), unit="cluster")
         added_total = 0
+        errors = 0
         try:
             for i in range(0, len(todo), BATCH):
                 batch = todo[i:i + BATCH]
                 try:
                     n = fetch_cluster_resources(s, sk, uid, psid, batch)
                     added_total += n
+                except AuthError:
+                    raise
                 except Exception as e:
+                    errors += 1
                     log.error(f"batch {i}: {e}")
+                    if errors <= 3:
+                        tqdm.write(f"  ✗ пачка {i}: {e}")
                     time.sleep(2)
                 bar.update(len(batch))
                 bar.set_postfix(files=added_total)
@@ -284,6 +250,10 @@ def cmd_collect():
         print(f"\n  ✓ Файлов в БД: {sum(stats.values())}")
         for k, v in stats.items():
             print(f"     {k}: {v}")
+        if errors:
+            print(f"  ⚠ пачек с ошибкой: {errors} (подробности в {LOG_FILE})")
+            if not added_total:
+                sys.exit("Ни одного файла не собрано — см. ошибки выше")
     finally:
         try: s.close()
         except Exception: pass
@@ -302,24 +272,146 @@ def cmd_status():
     for k, v in stats.items():
         print(f"  {k}: {v}")
 
+    recent = db().execute(
+        "SELECT COUNT(*) FROM unlim_files WHERE status='downloaded' "
+        "AND downloaded_at > datetime('now', '-5 minutes')").fetchone()[0]
+    print(f"Скачано за последние 5 минут: {recent}")
+    try:
+        workers = db().execute(
+            "SELECT * FROM unlim_workers ORDER BY worker_id").fetchall()
+    except sqlite3.OperationalError:
+        workers = []  # таблицу создаёт unlim_worker.py при первом запуске
+    if workers:
+        now = time.time()
+        print("\nВоркеры:")
+        for w in workers:
+            line = f"  w{w['worker_id']:<3} {w['state'] or '—':<12} скачал {w['files_done'] or 0:>5}"
+            if w["state"] == "running" and w["file_id"]:
+                secs = int(now - (w["file_started"] or now))
+                mark = "  ← залип?" if secs > 60 else ""
+                line += f"  сейчас: {w['file_id']} ({secs}с){mark}"
+            elif w["last_error"]:
+                line += f"  последняя ошибка: {w['last_error'][:100]}"
+            print(line)
+
+
+# Та же метка, что ставит WebUI при выборе категорий — его «Скачать выбранное»
+# умеет её снимать, и наоборот
+SKIP_MARKER = "not in selected categories"
+
+
+def is_photo(file_id: str, name: str | None, mime: str | None) -> bool:
+    """Сначала по MIME (image/... или голый type от photoslice), потом по расширению."""
+    kind = (mime or "").lower().split("/", 1)[0]
+    if kind == "image":
+        return True
+    if kind in ("video", "audio", "application", "text"):
+        return False
+    for s in (name, file_id):
+        if s and os.path.splitext(s)[1].lower() in PHOTO_EXTS:
+            return True
+    return False
+
+
+def cmd_photos_only():
+    """Помечает pending не-фото как skipped — воркеры их не берут."""
+    if not os.path.exists(DB_FILE):
+        sys.exit("БД пуста — запусти --collect")
+    db_init()
+    c = db()
+    rows = c.execute(
+        "SELECT file_id, name, mime FROM unlim_files WHERE status='pending'"
+    ).fetchall()
+    skip = [r for r in rows if not is_photo(r["file_id"], r["name"], r["mime"])]
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        c.executemany(
+            "UPDATE unlim_files SET status='skipped', error=? WHERE file_id=?",
+            [(SKIP_MARKER, r["file_id"]) for r in skip],
+        )
+        c.execute("COMMIT")
+    except Exception:
+        try: c.execute("ROLLBACK")
+        except sqlite3.Error: pass
+        raise
+    print(f"Только фото: оставлено {len(rows) - len(skip)}, пропущено {len(skip)}")
+    kinds: dict[str, int] = {}
+    for r in skip:
+        k = (r["mime"] or os.path.splitext(r["name"] or r["file_id"])[1] or "?").lower()
+        kinds[k] = kinds.get(k, 0) + 1
+    for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])[:10]:
+        print(f"  пропущено {k}: {n}")
+
+
+def cmd_all_types():
+    """Откатывает --photos-only: возвращает пропущенные по типу в pending."""
+    if not os.path.exists(DB_FILE):
+        sys.exit("БД пуста — запусти --collect")
+    db_init()
+    n = db().execute(
+        "UPDATE unlim_files SET status='pending', error=NULL "
+        "WHERE status='skipped' AND error=?", (SKIP_MARKER,),
+    ).rowcount
+    print(f"Возвращено в очередь: {n}")
+
+
+def cmd_retry_failed():
+    """Возвращает failed в очередь (например, после сбоя хранилища Яндекса)."""
+    if not os.path.exists(DB_FILE):
+        sys.exit("БД пуста — запусти --collect")
+    db_init()
+    rows = db().execute(
+        "SELECT error, COUNT(*) AS n FROM unlim_files WHERE status='failed' "
+        "GROUP BY error ORDER BY n DESC LIMIT 5").fetchall()
+    for r in rows:
+        print(f"  {r['n']}× {r['error']}")
+    try:
+        n = db().execute(
+            "UPDATE unlim_files SET status='pending', error=NULL, retries=0, "
+            "next_try_at=NULL WHERE status='failed'").rowcount
+    except sqlite3.OperationalError:
+        # Колонок retries/next_try_at ещё нет — их добавляет unlim_worker.py
+        n = db().execute(
+            "UPDATE unlim_files SET status='pending', error=NULL WHERE status='failed'"
+        ).rowcount
+    print(f"Возвращено в очередь: {n}")
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--collect", action="store_true",
                     help="Собрать список файлов из photoslice")
+    ap.add_argument("--photos-only", action="store_true",
+                    help="Качать только фото: остальное пометить skipped "
+                         "(можно вместе с --collect)")
+    ap.add_argument("--all-types", action="store_true",
+                    help="Отменить --photos-only")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="Вернуть failed в очередь")
     ap.add_argument("--status", action="store_true",
                     help="Показать статус БД")
     args = ap.parse_args()
+    if not (args.collect or args.photos_only or args.all_types
+            or args.retry_failed or args.status):
+        ap.print_help()
+        return
     if args.collect:
         cmd_collect()
-    elif args.status:
+    if args.all_types:
+        cmd_all_types()
+    if args.photos_only:
+        cmd_photos_only()
+    if args.retry_failed:
+        cmd_retry_failed()
+    if args.status:
         cmd_status()
-    else:
-        ap.print_help()
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main() or 0)
+    except RuntimeError as e:  # AuthError/ApiError и исчерпанные ретраи
+        log.error(str(e))
+        sys.exit(f"✗ {e}")
     except KeyboardInterrupt:
         sys.exit(130)

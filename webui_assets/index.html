@@ -110,6 +110,22 @@
     transition:border-color .2s;
   }
   .card:hover{border-color:var(--hairline-strong)}
+  /* Воркеры безлимита */
+  .wk-wrap{overflow-x:auto}
+  .wk{width:100%;border-collapse:collapse;font-size:13px}
+  .wk th{text-align:left;font-weight:500;color:var(--text-tertiary);padding:6px 8px;border-bottom:0.5px solid var(--hairline-strong);white-space:nowrap}
+  .wk th[data-sort]{cursor:pointer;user-select:none}
+  .wk th[data-sort]:hover,.wk th.sorted{color:var(--text)}
+  .wk td{padding:6px 8px;border-bottom:0.5px solid var(--hairline);vertical-align:top}
+  .wk td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .wk .file{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .wk .err{max-width:320px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .wk tr.stuck td{background:rgba(255,159,10,.08)}
+  .wk tr.stuck .secs{color:var(--orange);font-weight:600}
+  .wk tr.off td{color:var(--text-tertiary)}
+  .wk-sum{font-size:13px;color:var(--text-secondary);margin-bottom:10px}
+  .wk-sum b{color:var(--text)}
+  .wk-sum .bad{color:var(--orange)}
   .card-title{font-size:20px;font-weight:600;letter-spacing:-.02em;margin-bottom:6px}
   .card-sub{font-size:14px;color:var(--text-secondary);margin-bottom:18px}
 
@@ -807,7 +823,13 @@
       <button class="primary" onclick="downloadSelected('unlim', this)">
         <svg class="ico-sm"><use href="#i-arrow-down"/></svg>Скачать выбранное
       </button>
-      <span class="muted" style="font-size:13px">Воркеров: <input type="number" id="unlim-workers" value="4" min="1" max="6" style="width:50px;text-align:center;padding:4px;background:var(--surface2);color:var(--text);border:0.5px solid var(--hairline-strong);border-radius:6px"></span>
+      <button id="unlim-retry-failed" onclick="retryFailed(this)" style="display:none"
+              title="Вернуть файлы с ошибкой и файлы, у которых есть только превью, в очередь за оригиналом">↺ Вернуть ошибки в очередь</button>
+      <button id="unlim-previews" onclick="startPreviews(this)" style="display:none"
+              title="Для фото, чей оригинал не скачался, скачать превью до 1280 px в _unlim_previews. Оригинал можно будет докачать позже — превью заменится">🖼 Скачать превью для ошибок</button>
+      <span class="muted" style="font-size:13px">Воркеров: <input type="number" id="unlim-workers" value="4" min="1" max="100" style="width:50px;text-align:center;padding:4px;background:var(--surface2);color:var(--text);border:0.5px solid var(--hairline-strong);border-radius:6px"></span>
+      <label class="opt-pill" title="Каждый файл отдельным запросом. Работает, даже когда Яндекс отключил архивы"><input type="radio" name="unlim-mode" value="single" checked> По одному</label>
+      <label class="opt-pill" title="Пачками по 250 файлов через ZIP. Быстрее, но Яндекс может отключить архивы (code 394)"><input type="radio" name="unlim-mode" value="zip"> Архивами</label>
       <button class="danger" onclick="clearDb('unlim')" style="margin-left:auto">
         <svg class="ico-sm"><use href="#i-stop"/></svg>Очистить и заново
       </button>
@@ -838,6 +860,17 @@
     <div class="stat">
       <div class="stat-label">Ошибок</div>
       <div class="stat-value num" id="u-failed" style="color:var(--red)">0</div>
+    </div>
+  </div>
+
+  <div class="card" id="unlim-workers-card" style="display:none">
+    <div class="section-label" style="margin:0 0 8px">Воркеры</div>
+    <div class="wk-sum" id="unlim-workers-sum">—</div>
+    <div class="wk-wrap">
+      <table class="wk">
+        <thead id="unlim-workers-head"><tr><th data-sort="id">#</th><th data-sort="state">Состояние</th><th data-sort="file">Сейчас качает</th><th data-sort="file_secs">На нём</th><th data-sort="files_done">Скачал</th><th data-sort="last_ok_ago">Последний успех</th><th data-sort="last_error_ago">Последняя ошибка</th><th></th></tr></thead>
+        <tbody id="unlim-workers-body"></tbody>
+      </table>
     </div>
   </div>
 
@@ -1230,7 +1263,7 @@ async function refreshPreview(kind){
       <div class="row-icon ${meta.cls}"><svg class="icat"><use href="#${meta.icon}"/></svg></div>
       <div class="row-body">
         <div class="row-title">${meta.label}</div>
-        <div class="row-sub">${info.count.toLocaleString('ru')} файлов · ${human(info.bytes)}</div>
+        <div class="row-sub">${previewSub(info)}</div>
       </div>
       <div class="toggle ${isSelected?'on':''}" data-cat="${key}" data-kind="${kind}"></div>
     `;
@@ -1247,16 +1280,79 @@ async function refreshPreview(kind){
   updateSelectedSummary(kind, cats);
 }
 
+// «5 000 файлов · скачано 3 500 (12 ГБ) · осталось 1 400 · ошибок 80 · пропущено 20»
+function previewSub(info){
+  const n = x => (x||0).toLocaleString('ru');
+  const parts = [`${n(info.count)} файлов` + (info.bytes ? ` · ${human(info.bytes)}` : '')];
+  if(info.done) parts.push(`<span style="color:var(--green)">скачано ${n(info.done)}` +
+                           (info.done_bytes ? ` (${human(info.done_bytes)})` : '') + '</span>');
+  if(info.left) parts.push(`осталось <b style="color:var(--text)">${n(info.left)}</b>`);
+  if(info.failed) parts.push(`<span style="color:var(--red)">ошибок ${n(info.failed)}</span>`);
+  if(info.preview) parts.push(`<span style="color:var(--orange)" title="Оригинал недоступен, скачано превью до 1280 px">только превью ${n(info.preview)}</span>`);
+  if(info.skipped) parts.push(`пропущено ${n(info.skipped)}`);
+  return parts.join(' · ');
+}
+
+// Текст ошибки сервера вместо молчаливого «Готово»
+function apiError(r, d){
+  const det = d && d.detail;
+  const msg = typeof det === 'string' ? det : Array.isArray(det) ? det.map(x => x.msg).join('; ') : '';
+  return `Ошибка сервера ${r.status}` + (msg ? `: ${msg}` : '');
+}
+
+async function startPreviews(btn){
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/unlim/previews', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({workers: 4})});
+    const d = await r.json();
+    toast(r.ok ? (d.msg || 'Готово') : apiError(r, d), r.ok && d.ok!==false ? 'ok' : 'err');
+  } catch(e){ toast('Сеть: '+e.message,'err') }
+  btn.disabled = false;
+}
+
+async function retryFailed(btn){
+  const cats = Object.keys(selectedCats.unlim).filter(k => selectedCats.unlim[k]);
+  if(cats.length === 0){ toast('Ничего не выбрано','err'); return }
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/unlim/retry_failed', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({categories: cats})});
+    const d = await r.json();
+    toast(r.ok ? (d.msg || 'Готово') : apiError(r, d), r.ok && d.ok!==false ? 'ok' : 'err');
+  } catch(e){ toast('Сеть: '+e.message,'err') }
+  btn.disabled = false;
+  refreshPreview('unlim');
+}
+
 function updateSelectedSummary(kind, cats){
-  let count = 0, bytes = 0;
+  // Всего выбрано и сколько из этого уже скачано. Общий объём не показываем:
+  // у безлимита размеры известны только для скачанных файлов
+  let count = 0, done = 0, doneBytes = 0;
   for(const k of Object.keys(selectedCats[kind])){
     if(selectedCats[kind][k] && cats[k]){
       count += cats[k].count;
-      bytes += cats[k].bytes;
+      done += cats[k].done || 0;
+      doneBytes += cats[k].done_bytes || 0;
     }
   }
   document.getElementById(`${kind}-preview-selected`).textContent =
-    `${count.toLocaleString('ru')} файлов · ${human(bytes)}`;
+    `${count.toLocaleString('ru')} файлов · скачано ${done.toLocaleString('ru')}` +
+    (doneBytes ? ` (${human(doneBytes)})` : '');
+  const rb = kind === 'unlim' && document.getElementById('unlim-retry-failed');
+  if(rb){
+    let failed = 0, preview = 0;
+    for(const k of Object.keys(selectedCats.unlim)) if(selectedCats.unlim[k] && cats[k]){
+      failed += cats[k].failed || 0; preview += cats[k].preview || 0;
+    }
+    rb.style.display = failed + preview ? '' : 'none';
+    rb.textContent = `↺ Вернуть ошибки в очередь (${(failed + preview).toLocaleString('ru')})`;
+    // Превью — только для фото
+    const pb = document.getElementById('unlim-previews');
+    const photoFailed = (cats.photos && cats.photos.failed) || 0;
+    pb.style.display = photoFailed ? '' : 'none';
+    pb.textContent = `🖼 Скачать превью для ошибок (${photoFailed.toLocaleString('ru')})`;
+  }
 }
 
 async function clearLog(kind){
@@ -1307,6 +1403,8 @@ async function downloadSelected(kind, btn){
     ? (+document.getElementById('unlim-workers').value || 4)
     : 4;
   const url = kind === 'disk' ? '/api/disk/download_selected' : '/api/unlim/download_selected';
+  const single = (document.querySelector('input[name="unlim-mode"]:checked')||{}).value !== 'zip';
+  if(kind === 'unlim'){ try{ localStorage.setItem('unlim-mode', single ? 'single' : 'zip') }catch(e){} }
 
   // Сразу показать live-баннер
   const banner = document.getElementById(`${kind}-download-banner`);
@@ -1315,7 +1413,7 @@ async function downloadSelected(kind, btn){
   document.getElementById(`${kind}-download-title`).textContent =
     kind === 'disk' ? 'Скачиваю обычный диск…' : 'Скачиваю безлимит…';
   document.getElementById(`${kind}-download-sub`).innerHTML =
-    `Категории: ${cats.map(c => CAT_META[c]?.label || c).join(', ')} · потоков: ${workers}`;
+    `Категории: ${cats.map(c => CAT_META[c]?.label || c).join(', ')} · потоков: ${workers}${kind === 'unlim' ? (single ? ' · по одному' : ' · архивами') : ''}`;
   document.getElementById(`${kind}-download-time`).textContent = '0с';
   setTimeout(()=>banner.scrollIntoView({behavior:'smooth', block:'center'}), 50);
 
@@ -1327,7 +1425,7 @@ async function downloadSelected(kind, btn){
   }
 
   try {
-    const r = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({categories:cats, workers})});
+    const r = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({categories:cats, workers, single})});
     const d = await r.json();
     toast(d.ok===false ? (d.msg||'Ошибка') : 'Скачивание запущено', d.ok===false?'err':'ok');
   } catch(e){toast('Сеть: '+e.message,'err')}
@@ -1768,6 +1866,102 @@ if (window.location.protocol === 'file:') {
   const warn = document.getElementById('file-protocol-warning');
   if (warn) warn.style.display = 'block';
 }
+
+// ────── Воркеры безлимита: что качают и на чём залипли ──────
+const escA = s => esc(s).replace(/"/g, '&quot;');  // для атрибутов
+function ago(sec){
+  if(sec == null) return '—';
+  if(sec < 60) return sec + 'с';
+  if(sec < 3600) return Math.floor(sec/60) + 'м ' + (sec%60) + 'с';
+  return Math.floor(sec/3600) + 'ч ' + Math.floor(sec%3600/60) + 'м';
+}
+// Сортировка: клик по заголовку, повторный — обратный порядок; выбор помним
+let _wkData = null;
+let wkSort = {key: 'id', dir: 1};
+try { wkSort = JSON.parse(localStorage.getItem('unlim-workers-sort')) || wkSort } catch(e){}
+// Значения для сравнения. «Никогда не было успеха» — хуже любого «давно»
+const WK_SORT_VAL = {
+  id: w => w.id,
+  state: w => (w.stuck ? '0' : w.active ? '1' : '2') + (w.state || ''),  // залипшие, работающие, остальные
+  file: w => w.file || '',
+  file_secs: w => w.active ? (w.file_secs ?? -1) : -1,
+  files_done: w => w.files_done || 0,
+  last_ok_ago: w => w.last_ok_ago ?? Infinity,
+  last_error_ago: w => w.last_error_ago ?? Infinity,
+};
+document.getElementById('unlim-workers-head').addEventListener('click', e => {
+  const key = e.target.closest('th')?.dataset.sort;
+  if(!key) return;
+  wkSort = wkSort.key === key ? {key, dir: -wkSort.dir} : {key, dir: 1};
+  try { localStorage.setItem('unlim-workers-sort', JSON.stringify(wkSort)) } catch(e){}
+  renderWorkers();
+});
+async function refreshWorkers(){
+  try { _wkData = await (await fetch('/api/unlim/workers')).json(); } catch(e){ return }
+  renderWorkers();
+}
+function renderWorkers(){
+  const d = _wkData;
+  if(!d) return;
+  const card = document.getElementById('unlim-workers-card');
+  const val = WK_SORT_VAL[wkSort.key] || WK_SORT_VAL.id;
+  const ws = [...(d.workers || [])].sort((a, b) => {
+    const x = val(a), y = val(b);
+    return (x < y ? -1 : x > y ? 1 : a.id - b.id) * (x === y ? 1 : wkSort.dir);
+  });
+  document.querySelectorAll('#unlim-workers-head th[data-sort]').forEach(th => {
+    const on = th.dataset.sort === wkSort.key;
+    th.classList.toggle('sorted', on);
+    th.textContent = th.textContent.replace(/ [▲▼]$/, '') + (on ? (wkSort.dir > 0 ? ' ▲' : ' ▼') : '');
+  });
+  if(ws.length === 0){ card.style.display = 'none'; return }
+  card.style.display = 'block';
+  const active = ws.filter(w => w.active);
+  const stuck = active.filter(w => w.stuck);
+  const lastBad = d.last_done_ago != null && d.last_done_ago > 120 && active.length > 0;
+  document.getElementById('unlim-workers-sum').innerHTML =
+    `Работают: <b>${active.length}</b> из ${ws.length}` +
+    ` · за 5 минут скачано: <b>${(d.recent_5m||0).toLocaleString('ru')}</b>` +
+    ` · последний файл: <b class="${lastBad?'bad':''}">${d.last_done_ago==null?'—':ago(d.last_done_ago)+' назад'}</b>` +
+    (stuck.length ? ` · <span class="bad">молчат дольше ${d.stuck_after}с: ${stuck.length}</span>` : '');
+  document.getElementById('unlim-workers-body').innerHTML = ws.map(w => {
+    const isStuck = w.stuck;
+    const file = w.file ? w.file.replace(/^\/photounlim\//, '') : '—';
+    const att = w.active && w.attempt > 1 ? ` <span class="muted">(попытка ${w.attempt})</span>` : '';
+    return `<tr class="${isStuck?'stuck':''} ${w.active?'':'off'}">
+      <td class="num">${w.id}</td>
+      <td>${esc(w.state||'—')}${w.mode==='zip'?' · zip':''}${w.restarts ? ` <span class="muted" title="Автоматических воскрешений за последний час">↺${w.restarts}</span>` : ''}</td>
+      <td class="file" title="${escA(w.file||'')}">${esc(file)}${att}</td>
+      <td class="num secs">${w.active ? ago(w.file_secs) : '—'}</td>
+      <td class="num">${(w.files_done||0).toLocaleString('ru')} · ${human(w.bytes_done||0)}</td>
+      <td class="num">${w.last_ok_ago==null ? '—' : ago(w.last_ok_ago)+' назад'}</td>
+      <td class="err" title="${escA(w.last_error||'')}">${w.last_error ? esc(ago(w.last_error_ago)+' назад: '+w.last_error) : '—'}</td>
+      <td>${w.active ? `<button class="${isStuck?'danger':''}" style="padding:3px 9px;font-size:12px" onclick="restartWorker(${w.id}, this)" title="Остановить и сразу запустить заново. Текущий файл откладывается на 5 мин">↻ Перезапустить</button>` : ''}</td>
+    </tr>`;
+  }).join('');
+}
+async function restartWorker(id, btn){
+  if(btn){ btn.disabled = true; btn.textContent = '…' }
+  try {
+    const d = await (await fetch(`/api/unlim/workers/${id}/restart`, {method:'POST'})).json();
+    toast(d.ok===false ? (d.msg||'Ошибка') : `Воркер ${id} перезапущен`, d.ok===false?'err':'ok');
+  } catch(e){ toast('Сеть: '+e.message,'err') }
+  setTimeout(refreshWorkers, 1500);
+}
+setInterval(refreshWorkers, 3000);
+// Превью безлимита само обновляется, пока видна его вкладка
+setInterval(() => {
+  const card = document.getElementById('unlim-preview-card');
+  if(card && card.offsetParent !== null) refreshPreview('unlim').catch(()=>{});
+}, 15000);
+refreshWorkers();
+
+// Последний выбранный режим скачивания безлимита
+try {
+  const m = localStorage.getItem('unlim-mode');
+  const el = m && document.querySelector(`input[name="unlim-mode"][value="${m}"]`);
+  if(el) el.checked = true;
+} catch(e){}
 
 refresh();
 setInterval(refresh, 1500);
