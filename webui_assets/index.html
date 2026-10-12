@@ -1288,7 +1288,8 @@ function previewSub(info){
                            (info.done_bytes ? ` (${human(info.done_bytes)})` : '') + '</span>');
   if(info.left) parts.push(`осталось <b style="color:var(--text)">${n(info.left)}</b>`);
   if(info.failed) parts.push(`<span style="color:var(--red)">ошибок ${n(info.failed)}</span>`);
-  if(info.preview) parts.push(`<span style="color:var(--orange)" title="Оригинал недоступен, скачано превью до 1280 px">только превью ${n(info.preview)}</span>`);
+  const prev = info.has_preview ?? info.preview;
+  if(prev) parts.push(`<span style="color:var(--orange)" title="Оригинала пока нет, скачано превью до 1280 px. ${n(info.preview || 0)} — оригинал окончательно не дался, остальные ещё в очереди за оригиналом">только превью ${n(prev)}</span>`);
   if(info.skipped) parts.push(`пропущено ${n(info.skipped)}`);
   return parts.join(' · ');
 }

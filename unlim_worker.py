@@ -362,6 +362,37 @@ def mark_preview(file_id: str, path: str):
         c.close()
 
 
+def grab_preview_early(s, sk, uid, worker_id: int, fid: str) -> None:
+    """Оригинал фото не дался с первой попытки — сразу забираем превью, не
+    дожидаясь, пока файл пройдёт все откладывания и попадёт в failed.
+    Статус не трогаем: оригинал дальше пробуем как обычно, а при окончательной
+    неудаче FAILED_OR_PREVIEW оставит файл в preview."""
+    if os.path.splitext(fid)[1].lower() not in PHOTO_EXTS:
+        return
+    c = sqlite3.connect(DB_FILE, timeout=60)
+    try:
+        row = c.execute("SELECT preview_path FROM unlim_files WHERE file_id=?",
+                        (fid,)).fetchone()
+    finally:
+        c.close()
+    if not row or row[0]:
+        return
+    ws_set(worker_id, state="running", file_id=f"превью: {fid}",
+           file_started=time.time(), attempt=1)
+    try:
+        path, n = download_preview(s, sk, uid, fid)
+    except Exception as e:  # и AuthError — его поймает следующий оригинал
+        logging.warning(f"w{worker_id} early preview {fid}: {e}")
+        return
+    c = sqlite3.connect(DB_FILE, timeout=60)
+    try:
+        c.execute("UPDATE unlim_files SET preview_path=? WHERE file_id=?", (path, fid))
+        c.commit()
+    finally:
+        c.close()
+    print(f"[w{worker_id}] 🖼 {fid}: взял превью ({n // 1024} КБ)")
+
+
 def run_preview_batch(s, sk, uid, worker_id: int, paths: list[str]) -> tuple[int, int]:
     files = bytes_ = 0
     for i, fid in enumerate(paths):
@@ -608,6 +639,7 @@ def run_single_batch(s, sk, uid, worker_id: int, paths: list[str],
                     # Таймаут/обрыв/медленно на узле storage — не долбим тот же
                     # файл, а откладываем и сразу берём следующий
                     transient += 1
+                    grab_preview_early(s, sk, uid, worker_id, fid)
                     what = defer_or_fail(fid, f"single: {e}")
                     logging.info(f"w{worker_id} {fid}: {e} → {what}")
                     print(f"[w{worker_id}] ⏭ {fid}: {str(e)[:150]} → {what}")
@@ -616,6 +648,7 @@ def run_single_batch(s, sk, uid, worker_id: int, paths: list[str],
                     fails += 1
                 logging.warning(f"w{worker_id} single {fid}: {e}")
                 print(f"[w{worker_id}] ✗ {fid}: {str(e)[:300]}")
+                grab_preview_early(s, sk, uid, worker_id, fid)
                 mark_failed([fid], f"single: {e}")
                 if fails >= MAX_SINGLE_FAILS:
                     print(f"[w{worker_id}] {fails} ошибок подряд — выхожу")

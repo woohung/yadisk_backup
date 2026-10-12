@@ -866,18 +866,24 @@ def preview_db(db_file: Path, table: str, id_col: str) -> dict:
         summary: dict[str, dict] = {
             k: {"count": 0, "bytes": 0, "label": CATEGORY_LABELS[k],
                 "done": 0, "done_bytes": 0, "left": 0, "failed": 0, "skipped": 0,
-                "preview": 0}
+                "preview": 0, "has_preview": 0}
             for k in list(CATEGORY_LABELS.keys())
         }
         total = 0
-        for path, size, status in c.execute(
-            f"SELECT {id_col}, COALESCE(size, 0), status FROM {table} "
+        # preview_path есть только в безлимитной БД: превью берётся ещё до того,
+        # как оригинал окончательно сдался (файл может быть в pending)
+        cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+        has_prev = "preview_path IS NOT NULL" if "preview_path" in cols else "0"
+        for path, size, status, with_prev in c.execute(
+            f"SELECT {id_col}, COALESCE(size, 0), status, {has_prev} FROM {table} "
             f"WHERE status IN ('pending','downloaded','skipped','in_progress','failed',"
             f"'preview','preview_in_progress')"
         ):
             cat = summary[categorize(path)]
             cat["count"] += 1
             cat["bytes"] += size
+            if with_prev and status != "downloaded":
+                cat["has_preview"] += 1
             if status == "downloaded":
                 cat["done"] += 1
                 cat["done_bytes"] += size
